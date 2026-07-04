@@ -34,6 +34,17 @@
   var SELFHEAL_MS = 60000;          // slow per-sub re-hello keepalive: re-registers if the bridge ever
                                     // dropped our client (half-open self-heal). Idempotent on the bridge
                                     // (re-ack, no churn) when still live; recovers tools when not.
+  var FS_OP_TIMEOUT_MS = 8000;      // cap on any single FSA op (getFileHandle/createWritable/write/close).
+                                    // A days-long PWA can leak an exclusive OPFS write-lock so createWritable
+                                    // HANGS forever — without this cap the tick wedges silently + every tool
+                                    // call times out. With it, a stuck write fails fast + loud (see _writeFrame).
+
+  // Race an FSA op against a timeout so a stuck lock rejects instead of hanging the whole channel tick.
+  function _fsTimeout(promise, label) {
+    var t;
+    var timer = new Promise(function (_, rej) { t = setTimeout(function () { rej(new Error('fs op timed out (' + FS_OP_TIMEOUT_MS + 'ms): ' + label)); }, FS_OP_TIMEOUT_MS); });
+    return Promise.race([promise, timer]).then(function (v) { clearTimeout(t); return v; }, function (e) { clearTimeout(t); throw e; });
+  }
 
   var _tools = new Map();
   var _transport = null;            // { type: 'ws'|'http', ... } — the localhost (single) transport
@@ -223,25 +234,25 @@
     return {
       async read(name) {
         var p = parts(name), fn = p.pop();
-        try { var d = await dirOf(p, false); var fh = await d.getFileHandle(fn, { create: false }); return await (await fh.getFile()).text(); }
-        catch (e) { return null; }
+        try { var d = await _fsTimeout(dirOf(p, false), 'read.dir ' + name); var fh = await _fsTimeout(d.getFileHandle(fn, { create: false }), 'read.fh ' + name); return await _fsTimeout((await _fsTimeout(fh.getFile(), 'read.file ' + name)).text(), 'read.text ' + name); }
+        catch (e) { return null; }   // absent OR wedged/timed-out — a null read is non-fatal (caller retries; a stuck WRITE is where we fail loud)
       },
       async write(name, str) {
         var p = parts(name), fn = p.pop();
-        var d = await dirOf(p, true);
-        var fh = await d.getFileHandle(fn, { create: true });
-        var w = await fh.createWritable();
-        try { await w.write(str); } finally { await w.close(); }   // always release the OPFS write lock
+        var d = await _fsTimeout(dirOf(p, true), 'write.dir ' + name);
+        var fh = await _fsTimeout(d.getFileHandle(fn, { create: true }), 'write.fh ' + name);
+        var w = await _fsTimeout(fh.createWritable(), 'createWritable ' + name);   // ← the days-long-hang point
+        try { await _fsTimeout(w.write(str), 'write ' + name); } finally { await _fsTimeout(w.close(), 'close ' + name); }   // always release the OPFS write lock
       },
       async list(dirp) {
-        try { var d = await dirOf(parts(dirp), false); var names = []; for await (var key of d.keys()) names.push(key); return names; }
+        try { var d = await _fsTimeout(dirOf(parts(dirp), false), 'list.dir ' + dirp); var names = []; for await (var key of d.keys()) names.push(key); return names; }
         catch (e) { return []; }
       },
       async remove(name) {
         var p = parts(name), fn = p.pop();
         try { var d = await dirOf(p, false); await d.removeEntry(fn); } catch (e) { /* missing */ }
       },
-      async mkdirp(dirp) { await dirOf(parts(dirp), true); },
+      async mkdirp(dirp) { await _fsTimeout(dirOf(parts(dirp), true), 'mkdirp ' + dirp); },
       async rmrf(dirp) {
         var p = parts(dirp), last = p.pop();
         try { var d = await dirOf(p, false); await d.removeEntry(last, { recursive: true }); } catch (e) { /* missing */ }
@@ -327,7 +338,7 @@
           onWelcome: function (cid) { sub.clientId = cid; sub.state = 'connected'; reaggregate(); },
           onError: function () { sub.state = 'error'; reaggregate(); },
         }); },
-        onWarn: warn,
+        onWarn: function (m) { warn(m); if (/WRITE STUCK/.test(m)) { sub.state = 'error'; reaggregate(); } },   // transport wedged (leaked FSA lock) → stop showing 'connected'
       });
       sub.channel = channel;
       channel.send(helloMsg());

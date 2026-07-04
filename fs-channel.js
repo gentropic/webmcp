@@ -49,6 +49,9 @@ const GcuFsChannel = (function () {
   var ANNOUNCE_INTERVAL_MS = 30000;   // bridge.live refresh cadence (the ONLY periodic write)
   var LIVENESS_MS = 90000;            // page treats the bridge as down if bridge.live is older
   var SEG_RE = /^[A-Za-z0-9_-]+$/;    // a safe session/epoch path segment (defense-in-depth vs ../ traversal)
+  var WRITE_STUCK_WARN = 3;           // consecutive frame-write failures before we warn LOUD (a leaked
+                                      // browser FSA write-lock hangs every write → nothing recovers it but
+                                      // a full browser-process restart; surface that instead of hanging silent)
 
   function outboxOf(role) { return role === 'bridge' ? 'to-page' : 'to-bridge'; }
   function inboxOf(role) { return role === 'bridge' ? 'to-bridge' : 'to-page'; }
@@ -275,9 +278,16 @@ const GcuFsChannel = (function () {
         v: FS_VERSION, session: this.session, epoch: this.epoch, dir: dir, seq: seq, ts: ts, len: payload.length, sig: sig,
       }));
       this._outSeq = seq + 1;                                  // commit only on full success
+      this._writeFails = 0;
       return true;
     } catch (e) {
-      this._log('write failed seq ' + seq + ': ' + ((e && e.message) || e));
+      this._writeFails = (this._writeFails || 0) + 1;
+      this._log('write failed seq ' + seq + ' (' + this._writeFails + 'x): ' + ((e && e.message) || e));
+      // A leaked/stuck FSA write-lock hangs EVERY write (now caught by the shim's per-op timeout);
+      // repeated failures ⇒ the transport is wedged and only a browser-process restart clears it.
+      if (this._writeFails === WRITE_STUCK_WARN) {
+        this._warn('transport WRITE STUCK (' + this._writeFails + 'x) — likely a leaked browser file-write lock after a long run. RESTART THE BROWSER to recover (a reload / handle re-pick will NOT clear it).');
+      }
       return false;
     }
   };

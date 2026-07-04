@@ -153,6 +153,23 @@ async function main() {
   ok(bridge.epoch === realEpoch, 'forged epoch (bad HMAC) was NOT adopted');
   ok((await dir.list(`sessions/${bridge.session}`)).includes(realEpoch), 'the authenticated epoch was NOT swept by the forgery');
 
+  // ── stuck-write warning: a leaked FSA write-lock makes every frame-write fail; after a few
+  // consecutive failures the channel warns LOUD (restart the browser) instead of hanging silent ──
+  console.log('stuck-write warning:');
+  {
+    const warns = [];
+    const stuckRoot = await mkdtemp(join(tmpdir(), 'numen-stuck-'));
+    const badDir = makeNodeDir(stuckRoot);
+    badDir.write = async () => { throw new Error('createWritable hung (simulated stuck lock)'); };
+    const stuck = new FsChannel({ role: 'page', dir: badDir, hmac, now: () => Date.now(), randomId, session: 'stucksess', onWarn: (m) => warns.push(m) });
+    stuck.send({ type: 'hello' });
+    for (let i = 0; i < 6; i++) await stuck.tick();            // each tick tries the write, fails
+    const stuckWarns = warns.filter((w) => /WRITE STUCK/.test(w));
+    ok(stuckWarns.length === 1, 'warns exactly ONCE at the threshold (not every tick — no spam)');
+    ok(stuckWarns.length && /restart the browser/i.test(stuckWarns[0]), 'the warning tells the user to RESTART THE BROWSER');
+    await rm(stuckRoot, { recursive: true, force: true });
+  }
+
   await rm(root, { recursive: true, force: true });
 }
 
